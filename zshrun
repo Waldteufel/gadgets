@@ -1,0 +1,17 @@
+#!/usr/bin/zsh
+if [[ -z $ZSHRUN ]]
+then
+	export ZSHRUN=1
+	exec xsingleton --classname zshrun windowfocus \
+		-- urxvt +tr -b 9 -name zshrun -keysym.Escape 'string:\025\004' -geometry 42x1 -fn 'xft:Ubuntu Mono:size=22' \
+		-e zsh -its eval . "$0" "$@"
+fi
+
+PS1='%B❯%b '
+
+function accept-line() {
+	BUFFER="$BUFFER &!"
+	zle .accept-line
+}
+
+zle -N accept-line

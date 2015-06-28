@@ -1,0 +1,5 @@
+#!/usr/bin/zsh
+split=${@[(i)--]}
+filter=(${@[1,split-1]})
+cmdline=(${@[split+1,-1]})
+xdotool search "${filter[@]}" >/dev/null || exec "${cmdline[@]}"

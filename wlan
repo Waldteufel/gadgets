@@ -1,0 +1,55 @@
+#!/usr/bin/python
+
+import sys
+import dbus, dbus.mainloop.glib
+from gi.repository import GObject, GLib
+
+GObject.threads_init()
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+main_loop = GObject.MainLoop()
+
+import argparse
+parser = argparse.ArgumentParser(description='wpa_supplicant command line client')
+parser.add_argument('-i', '--interface', metavar='IFACE', help='wifi interface, first if missing')
+parser.add_argument('network', nargs='?', metavar='NET', help='network to enter or "any" to reset')
+args = parser.parse_args()
+
+if args.network is not None:
+    args.cmd = 'set'
+else:
+    args.cmd = 'list'
+
+if args.cmd == 'set':
+    if args.network == 'any':
+        args.network = None
+    else:
+        args.network = '"{}"'.format(args.network)
+
+system_bus = dbus.SystemBus()
+wpa_supplicant = dbus.Interface(system_bus.get_object('fi.w1.wpa_supplicant1', '/fi/w1/wpa_supplicant1'), 'fi.w1.wpa_supplicant1')
+
+if args.interface == None:
+    iface_path = wpa_supplicant.Get('fi.w1.wpa_supplicant1', 'Interfaces', dbus_interface='org.freedesktop.DBus.Properties')[0]
+else:
+    iface_path = wpa_supplicant.GetInterface(args.interface)
+
+wifi_interface = dbus.Interface(system_bus.get_object('fi.w1.wpa_supplicant1', iface_path), 'fi.w1.wpa_supplicant1.Interface')
+
+for netpath in wifi_interface.Get('fi.w1.wpa_supplicant1.Interface', 'Networks', dbus_interface='org.freedesktop.DBus.Properties'):
+    net = system_bus.get_object('fi.w1.wpa_supplicant1', netpath)
+    if args.cmd == 'set' and args.network is None:
+        net.Set('fi.w1.wpa_supplicant1.Network', 'Enabled', True, dbus_interface='org.freedesktop.DBus.Properties')
+    else:
+        props = net.Get('fi.w1.wpa_supplicant1.Network', 'Properties', dbus_interface='org.freedesktop.DBus.Properties')
+        if args.cmd == 'list':
+            print(props['ssid'][1:-1])
+        elif args.cmd == 'set' and props['ssid'] == args.network:
+            wifi_interface.SelectNetwork(netpath)
+            break
+else:
+    if args.cmd == 'set' and args.network is not None:
+        print('No network with ssid {}'.format(args.network), file=sys.stderr)
+        sys.exit(1)
+
+if args.cmd == 'set':
+    wifi_interface.Reassociate()
