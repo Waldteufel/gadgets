@@ -1,0 +1,28 @@
+#!/usr/bin/zsh
+
+OWN='2F1F D7A4 468D 7057 7BD4  4726 4D5B 6400 72C1 23B3'
+FPR="$*"
+
+i=1
+gpg --with-colons -k $FPR | grep '^uid:' | while IFS=':' read -A LINE
+do
+	if [[ ${LINE[2]} == 'f' ]]
+	then
+		export TMP_GNUPGHOME=$(mktemp -d)
+		gpg --export $OWN | gpg --homedir $TMP_GNUPGHOME --import
+		gpg --export $FPR | gpg --homedir $TMP_GNUPGHOME --import
+		gpg --homedir $TMP_GNUPGHOME --batch --command-fd=0 --status-fd=2 --edit-key $FPR <<-EOT
+			uid *
+			uid ${i}
+			deluid
+			yes
+			clean
+			save
+		EOT
+		gpg -a --homedir $TMP_GNUPGHOME --export $FPR >uid$i.asc
+		thunderbird -compose "subject='Signature for ${LINE[10]}',attachment='$PWD/uid$i.asc',to='${LINE[10]}',body='Find attached the signature for this identity.'"
+		sleep 5
+		rm -rf $TMP_GNUPGHOME
+	fi
+	let i=i+1
+done
