@@ -14,11 +14,15 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import weechat
+from collections import defaultdict
 
-weechat.register('bufmgr', 'Benjamin Richter <br@waldteufel.eu>', '0.1', 'GPL3', 'buffer manager', '', '')
+weechat.register('bufmgr', 'Benjamin Richter <br@waldteufel.eu>', '0.2', 'GPL3', 'buffer manager', '', '')
 weechat.hook_signal('hotlist_changed', 'hotlist_changed_hook', '')
-weechat.hook_signal('buffer_hidden', 'buffer_hidden_hook', '')
-weechat.hook_signal('buffer_unhidden', 'buffer_hidden_hook', '')
+weechat.hook_signal('buffer_opened', 'sort_buffers', '')
+weechat.hook_signal('buffer_hidden', 'sort_buffers', '')
+weechat.hook_signal('buffer_unhidden', 'sort_buffers', '')
+
+BUFFER_TYPES = defaultdict(lambda: 99, core=0, channel=1, query=2)
 
 def hotlist():
     hotlist = weechat.infolist_get("hotlist", "", "")
@@ -32,20 +36,23 @@ def buffers():
         yield weechat.infolist_pointer(buffers, 'pointer')
     weechat.infolist_free(buffers)
 
-def buffer_key(buf):
-    return weechat.buffer_get_integer(buf, "hidden")
+def buffer_key(bufs):
+    hidden = min(weechat.buffer_get_integer(buf, "hidden") for buf in bufs)
+    localvar_type = min(BUFFER_TYPES[weechat.buffer_get_string(buf, "localvar_type")] for buf in bufs)
+    return (hidden, localvar_type)
 
 def hotlist_changed_hook(udata, signal, data):
     for buf in hotlist():
         weechat.buffer_set(buf, "hidden", "0")
     return weechat.WEECHAT_RC_OK
 
-def buffer_hidden_hook(udata, signal, buf):
-    bufs = {}
+def sort_buffers(udata, signal, buf):
+    bufs_dict = defaultdict(set)
     for buf in buffers():
         if weechat.buffer_get_integer(buf, "active") != 0:
-           bufs[weechat.buffer_get_integer(buf, "number")] = buf
+           bufs_dict[weechat.buffer_get_integer(buf, "number")].add(buf)
 
-    for i, buf in enumerate(sorted(bufs.values(), key=buffer_key), 1):
+    for i, bufs in enumerate(sorted(bufs_dict.values(), key=buffer_key), 1):
+        buf = next(iter(bufs))
         weechat.buffer_set(buf, "number", str(i))
     return weechat.WEECHAT_RC_OK
