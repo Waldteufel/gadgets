@@ -1,0 +1,48 @@
+#!/usr/bin/perl
+
+# Installation:
+# 1. add configuration (see below) to ~/.Xresources
+# 2. put this file into ~/.urxvt/ext/
+#
+# URxvt.zoomBase: 12
+# URxvt.zoomLevel: 0
+# URxvt.zoomStep: 2
+# URxvt.zoomFont: -xos4-terminus-medium-r-normal--%d-*-*-*-*-*-iso10646-1,xft:Powerline Symbols
+# URxvt.font: -xos4-terminus-medium-r-normal--12-*-*-*-*-*-iso10646-1,xft:Powerline Symbols
+# URxvt.perl-ext-common: zoom
+# URxvt.keysym.C-equal: zoom:in
+# URxvt.keysym.C-minus: zoom:out
+
+use strict;
+use warnings;
+
+sub zoom_update_font
+{
+	my ($term) = @_;
+	
+	my $size = $term->x_resource("zoomBase") + int($term->{level} * $term->x_resource("zoomStep"));
+	my $font = sprintf($term->x_resource("zoomFont"), $size);
+	$term->cmd_parse("\033]50;${font}\007");
+}
+
+sub on_start
+{
+	my ($term) = @_;
+	$term->{level} = $term->x_resource("zoomLevel");
+}
+
+sub on_action
+{
+	my ($term, $string) = @_;
+
+	if ($string eq "in") {
+		$term->{level}++;
+	} elsif ($string eq "out") {
+		$term->{level}-- if $term->{level} gt 0;
+	} else {
+		return ();
+	}
+
+	zoom_update_font($term);
+	return 1;
+}
