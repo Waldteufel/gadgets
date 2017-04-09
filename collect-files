@@ -1,0 +1,76 @@
+#!/usr/bin/python3
+# collect-files - a tar frontend that supports including subdirectories of excluded directories
+# Benjamin Richter <br@waldteufel.eu>, Apr 2017
+
+"""
+Example:
+
+$ cat backup-these
+{"include": ["/home", "/home/my/.minecraft/saves", "/home/my/.minecraft/screenshots"],
+"exclude": ["*/.minecraft"]}
+$ collect-files backup-these -o /var/tmp/backup.tar
+
+"""
+
+import sys
+import json
+import os
+import io
+import os.path
+import fnmatch
+import tarfile
+import itertools
+import argparse
+
+spin = itertools.cycle(('/', '-', '\\', '|'))
+ctr = 0
+def print_spinner():
+    if sys.stderr.isatty():
+        global ctr
+        ctr += 1
+        if ctr == 1000:
+            ctr = 0
+            print('\b', next(spin), sep='', end='', file=sys.stderr)
+            sys.stderr.flush()
+
+parser = argparse.ArgumentParser(description="Builds a tar archive from include/exlude lists. Supports including subdirectories of excluded directories.")
+parser.add_argument('-v', '--verbose', action='count', help='print entries (once: top-level, twice: all)')
+parser.add_argument('config', nargs='?', type=argparse.FileType('r'), default=sys.stdin, metavar="CONFIG", help="configuration file (default: stdin)")
+parser.add_argument('-o', '--output', type=str, default='/dev/stdout', metavar="OUT", help="target tar file (default: stdout)")
+args = parser.parse_args()
+
+# cannot open '-' in binary mode via argparse.FileType
+if args.output == '-':
+    args.output = '/dev/stdout'
+
+cfg = json.load(args.config)
+
+def filter_tar(tarinfo):
+    if os.path.ismount(tarinfo.name):
+        return None
+    for pat in cfg['exclude']:
+        if fnmatch.fnmatch(tarinfo.name, pat):
+            return None
+    if args.verbose == 2:
+        if tarinfo.isdir():
+            print(tarinfo.name, "/", sep='', end='', file=sys.stderr)
+        else:
+            print(tarinfo.name, file=sys.stderr)
+    elif args.verbose == 1:
+        print_spinner()
+    return tarinfo
+
+with tarfile.open(args.output, mode='w|') as tar:
+    for p in cfg['include']:
+        if args.verbose == 1:
+            print(p, end='', file=sys.stderr)
+            if sys.stderr.isatty():
+                print('  ', end='', file=sys.stderr)
+            sys.stderr.flush()
+        tar.add(p, filter=filter_tar)
+        if args.verbose == 1:
+            if sys.stderr.isatty():
+                print('\b \b\b', end='', file=sys.stderr)
+                sys.stderr.flush()
+            print(file=sys.stderr)
+            sys.stderr.flush()
