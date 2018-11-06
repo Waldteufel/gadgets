@@ -2,18 +2,33 @@
 # status bar, to be used with i3bar
 
 import sys
+import systemd.journal
+import logging
+
+logging.getLogger().addHandler(systemd.journal.JournalHandler())
+
+def log_uncaught_exceptions(*exc_info):
+    if isinstance(exc_info[1], KeyboardInterrupt): return
+    logging.error('Unhandled exception:', exc_info=exc_info)
+sys.excepthook = log_uncaught_exceptions
+
 import os
 import math
 import json
 import time
 import threading
+import html
+import subprocess
 
 import colorsys
 
-from collections import deque
+from collections import deque, namedtuple
 
 from contextlib import contextmanager
 import dbus, dbus.mainloop.glib
+
+import gi
+gi.require_version('GUdev', '1.0')
 from gi.repository import GObject, GLib, GUdev, Gio
 
 
@@ -38,7 +53,7 @@ RED_WHITE_HSV = (0, 1/100, 14/15)
 
 class Bar(object):
 
-    def __init__(self, stream):
+    def __init__(self, stream, events=None):
         self.stream = stream
         self.lock = threading.Lock()
         stream.write('{ "version": 1, "click_events": false }\n')
@@ -52,6 +67,7 @@ class Bar(object):
         with self.lock:
             self.stream.write('[')
             self.first = True
+            self.handlers = {}
             yield
             self.stream.write('],\n')
             self.stream.flush()
@@ -72,15 +88,18 @@ def make_block(f):
     elif f > 1: return dict(full_text=chr(9600), color=RED_RGB)
     else: return dict(full_text=chr(9600 + math.ceil(8 * f)))
 
-def systemd_get_property(path, prop):
-    with open(path) as f:
-        for line in f:
-            if line.startswith('#'): continue
-            k, v = line.strip().split('=')
-            if k == prop:
-                return v
-        else:
-            return None
+def get_property(path, prop):
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith('#'): continue
+                k, v = line.strip().split('=')
+                if k == prop:
+                    return v
+            else:
+                return None
+    except FileNotFoundError:
+        return None
 
 def get_contents(*fn, dtype=str, default=None):
     try:
@@ -95,10 +114,12 @@ def update_bar():
     if os.getppid() == 1:
         main_loop.quit()
 
+    wpa_supplicant = system_bus.get_object('fi.w1.wpa_supplicant1', '/fi/w1/wpa_supplicant1')
+
     with bar.update():
         # networks
-        for ifname in os.listdir('/sys/class/net'):
-            if ifname == 'lo':
+        for ifname in sorted(os.listdir('/sys/class/net')):
+            if ifname == 'lo' or ifname == 'bonding_masters' or ifname.startswith('bond'):
                 continue
 
             ifindex = get_contents('/sys/class/net/{}/ifindex'.format(ifname), dtype=int)
@@ -107,17 +128,31 @@ def update_bar():
             color = GRAY_RGB
 
             if ifname.startswith('wl'):
-                wifi_interface = system_bus.get_object('fi.w1.wpa_supplicant1', wpa_supplicant.GetInterface(ifname))
-                bss_path = wifi_interface.Get('fi.w1.wpa_supplicant1.Interface', 'CurrentBSS', dbus_interface='org.freedesktop.DBus.Properties')
-                if bss_path != '/':
-                    bss = system_bus.get_object('fi.w1.wpa_supplicant1', bss_path)
-                    ssid = bss.Get('fi.w1.wpa_supplicant1.BSS', 'SSID', dbus_interface='org.freedesktop.DBus.Properties')
-                    text = "{}: {}".format(ifname, bytes(ssid).decode('utf8', errors='replace'))
-                if wifi_interface.Get('fi.w1.wpa_supplicant1.Interface', 'State', dbus_interface='org.freedesktop.DBus.Properties') == 'scanning':
-                    color = YELLOW_RGB
+                try:
+                    wifi_interface = system_bus.get_object('fi.w1.wpa_supplicant1', wpa_supplicant.GetInterface(ifname, dbus_interface='fi.w1.wpa_supplicant1'))
+                    bss_path = wifi_interface.Get('fi.w1.wpa_supplicant1.Interface', 'CurrentBSS', dbus_interface='org.freedesktop.DBus.Properties')
+                    if bss_path != '/':
+                        bss = system_bus.get_object('fi.w1.wpa_supplicant1', bss_path)
+                        ssid = bss.Get('fi.w1.wpa_supplicant1.BSS', 'SSID', dbus_interface='org.freedesktop.DBus.Properties')
+                        text = "{}: {}".format(ifname, bytes(ssid).decode('utf8', errors='replace'))
+                    if wifi_interface.Get('fi.w1.wpa_supplicant1.Interface', 'State', dbus_interface='org.freedesktop.DBus.Properties') == 'scanning':
+                        color = YELLOW_RGB
+                except:
+                    logging.exception('while inspecting wifi interface ' + ifname)
 
-            if systemd_get_property('/run/systemd/netif/links/{}'.format(ifindex), 'OPER_STATE') == 'routable':
-                color = GREEN_RGB
+            bonding_state = get_contents('/sys/class/net/{}/bonding_slave/state'.format(ifname))
+            operstate = get_contents('/sys/class/net/{}/operstate'.format(ifname))
+
+            if operstate != 'down':
+                while ifname is not None:
+                    if get_property('/run/systemd/netif/links/{}'.format(ifindex), 'OPER_STATE') == 'routable':
+                        if bonding_state == 'backup':
+                            color = WHITE_RGB
+                        else:
+                            color = GREEN_RGB
+                        break
+                    ifname = get_property('/sys/class/net/{}/master/uevent'.format(ifname), 'INTERFACE')
+                    ifindex = get_contents('/sys/class/net/{}/ifindex'.format(ifname), dtype=int)
 
             bar.append(full_text=text, color=color)
 
@@ -126,39 +161,67 @@ def update_bar():
         if os.path.exists(battery_path):
             status = get_contents(battery_path, 'status')
             energy_now = get_contents(battery_path, 'energy_now', dtype=int, default=0) / 1000000
-            if status == 'Discharging':
-                power_now = get_contents(battery_path, 'power_now', dtype=int, default=0) / 1000000
-                bar.append(full_text='{:.0f} W'.format(power_now))
-                if power_now > 0:
-                    alarm = get_contents(battery_path, 'alarm', dtype=int, default=0) / 1000000
-                    p = max(0, 1 - math.exp((alarm - energy_now) / power_now))
-                    energy_color = blend(p, low=RED_HSV, high=RED_WHITE_HSV)
-                else:
-                    energy_color = GRAY_RGB
+            power_now = get_contents(battery_path, 'power_now', dtype=int, default=0) / 1000000
+            alarm = get_contents(battery_path, 'alarm', dtype=int, default=0) / 1000000
+            if status == 'Discharging' and power_now > 0:
+                p = max(0, 1 - math.exp((alarm - energy_now) / power_now))
+                energy_color = blend(p, low=RED_HSV, high=RED_WHITE_HSV)
+                power_color = WHITE_RGB
+                power_now *= -1
             elif status == 'Charging':
-                energy_color = YELLOW_RGB
-            elif status == 'Full':
-                energy_color = GREEN_RGB
+                energy_color = WHITE_RGB
+                power_color = YELLOW_RGB
             else: # idle
-                energy_color = GRAY_RGB
-            bar.append(full_text='{:.0f} Wh'.format(energy_now), color=energy_color)
+                energy_color = WHITE_RGB
+                power_color = GRAY_RGB
+            bar.append(full_text='<span color="{}">{:.0f} Wh</span> <span color="{}">{:+.0f} W*dt</span>'.format(energy_color, energy_now, power_color, power_now), markup='pango')
 
-        # cpu load = 1 - idle time / total time
-        cpuload = 1 - (cpustat[-1][3] - cpustat[-2][3]) / (sum(cpustat[-1]) - sum(cpustat[-2]))
+        # cpu load = 1 - (idle + iowait) / total
+        cpuload = 1 - (cpustat_history[-1].idle - cpustat_history[-2].idle + cpustat_history[-1].iowait - cpustat_history[-2].iowait) / (sum(cpustat_history[-1]) - sum(cpustat_history[-2]))
         bar.append(full_text='{:3.0%}'.format(cpuload), color=blend(cpuload, low=YELLOW_GRAY_HSV, high=YELLOW_HSV))
 
         # cpu temp
-        temp = get_contents('/sys/class/thermal/thermal_zone1/temp', dtype=int) / 1000
-        tempcolor = max(0, min(1, (temp - 70) / 15))
-        bar.append(full_text='{:.0f} °C'.format(temp), color=blend(tempcolor, low=RED_WHITE_HSV, high=RED_HSV))
+        tempcolor = max(0, min(1, (temperature - 70) / 15))
+        bar.append(full_text='{:.0f} °C'.format(temperature), color=blend(tempcolor, low=RED_WHITE_HSV, high=RED_HSV))
+
+        # sound recording
+        rec_streams = pulse_core.Get('org.PulseAudio.Core1', 'RecordStreams', dbus_interface='org.freedesktop.DBus.Properties')
+        if len(rec_streams) > 0:
+            bar.append(full_text='● <span rise="-1000">REC</span>', color=RED_RGB, markup='pango')
 
         # sound volume
-        pulse_sink = pulse_bus.get_object(object_path=pulse_core.Get('org.PulseAudio.Core1', 'FallbackSink', dbus_interface='org.freedesktop.DBus.Properties'))
-        pulse_vol = pulse_sink.Get('org.PulseAudio.Core1.Device', 'Volume', dbus_interface='org.freedesktop.DBus.Properties')[0] / 65535
-        pulse_block = make_block(pulse_vol)
-        if pulse_sink.Get('org.PulseAudio.Core1.Device', 'Mute', dbus_interface='org.freedesktop.DBus.Properties'):
-            pulse_block['color'] = GRAY_RGB
-        bar.append(**pulse_block)
+        pulse_sink_path = None
+        try:
+            pulse_sink_path = pulse_core.Get('org.PulseAudio.Core1', 'FallbackSink', dbus_interface='org.freedesktop.DBus.Properties')
+        except:
+            logging.exception('while determining pulse fallback sink')
+
+        if pulse_sink_path:
+            try:
+                pulse_sink = pulse_bus.get_object(object_path=pulse_sink_path)
+                pulse_vol = pulse_sink.Get('org.PulseAudio.Core1.Device', 'Volume', dbus_interface='org.freedesktop.DBus.Properties')[0] / 65536
+                pulse_block = make_block(pulse_vol)
+                if pulse_sink.Get('org.PulseAudio.Core1.Device', 'IsNetworkDevice', dbus_interface='org.freedesktop.DBus.Properties'):
+                    pulse_block['markup'] = 'pango'
+                    pl = pulse_sink.Get('org.PulseAudio.Core1.Device', 'PropertyList', dbus_interface='org.freedesktop.DBus.Properties')
+                    host = bytes(pl['device.description'][:-1]).decode('utf8').split('@')[1]
+                    pulse_block['full_text'] = '{vol} <span rise="-1000">@{host}</span>'.format(host=html.escape(host), vol=pulse_block['full_text'])
+                    if 'color' not in pulse_block:
+                        pulse_block['color'] = YELLOW_RGB
+                if pulse_sink.Get('org.PulseAudio.Core1.Device', 'Mute', dbus_interface='org.freedesktop.DBus.Properties'):
+                    pulse_block['color'] = GRAY_RGB
+                bar.append(**pulse_block)
+            except:
+                logging.exception('while determining sink status')
+        else:
+            bar.append(full_text='?', color=GRAY_RGB)
+
+        # updates
+        #updates = get_contents(os.getenv('HOME'), '.cache/pacman/updates')
+        #if updates:
+        #    updates = updates.strip().split('\n')
+        #    if len(updates) > 0:
+        #        bar.append(full_text='▲<span rise="-1000">{}</span>'.format(len(updates)), markup='pango', color=GREEN_RGB)
 
         # clock
         bar.append(full_text=time.strftime('%b %d'))
@@ -178,11 +241,14 @@ def schedule_update(*args):
         next_update = GLib.idle_add(do_update)
     return True
 
-cpustat = deque([(0,) * 10], maxlen=2)
+CPUStat = namedtuple('CPUStat', ['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'steal'])
+cpustat_history = deque([CPUStat(0, 0, 0, 0, 0, 0, 0, 0)] * 2, maxlen=2)
 
-def update_cpustat(*args):
+def update_stats(*args):
+    global temperature
     with open('/proc/stat') as f:
-        cpustat.append(tuple(int(x) for x in f.readline().strip().split()[1:]))
+        cpustat_history.append(CPUStat(*(int(x) for x in f.readline().strip().split()[1:-2])))
+    temperature = get_contents('/sys/class/thermal/thermal_zone2/temp', dtype=int) / 1000
     return True
 
 GObject.threads_init()
@@ -194,15 +260,25 @@ bar = Bar(sys.stdout)
 time.sleep(1)
 
 system_bus = dbus.SystemBus()
-wpa_supplicant = dbus.Interface(system_bus.get_object('fi.w1.wpa_supplicant1', '/fi/w1/wpa_supplicant1'), 'fi.w1.wpa_supplicant1')
 system_bus.add_signal_receiver(schedule_update, 'PropertiesChanged', 'fi.w1.wpa_supplicant1.Interface')
 
-pulse_bus = dbus.connection.Connection('unix:path=/run/user/1000/pulse/dbus-socket')
+subprocess.call(['pacmd', 'unload-module module-dbus-protocol'], stdout=subprocess.DEVNULL)
+subprocess.call(['pacmd', 'load-module module-dbus-protocol'], stdout=subprocess.DEVNULL)
+
+pulse_bus = dbus.connection.Connection('unix:path=' + os.getenv('XDG_RUNTIME_DIR') + '/pulse/dbus-socket')
 pulse_core = pulse_bus.get_object(object_path='/org/pulseaudio/core1')
 pulse_bus.add_signal_receiver(schedule_update, 'VolumeUpdated', 'org.PulseAudio.Core1.Device')
 pulse_bus.add_signal_receiver(schedule_update, 'MuteUpdated', 'org.PulseAudio.Core1.Device')
+pulse_bus.add_signal_receiver(schedule_update, 'FallbackSinkUpdated', 'org.PulseAudio.Core1')
+pulse_bus.add_signal_receiver(schedule_update, 'FallbackSinkUnset', 'org.PulseAudio.Core1')
+pulse_bus.add_signal_receiver(schedule_update, 'NewRecordStream', 'org.PulseAudio.Core1')
+pulse_bus.add_signal_receiver(schedule_update, 'RecordStreamRemoved', 'org.PulseAudio.Core1')
 pulse_core.ListenForSignal('org.PulseAudio.Core1.Device.VolumeUpdated', dbus.Array(signature='o'))
 pulse_core.ListenForSignal('org.PulseAudio.Core1.Device.MuteUpdated', dbus.Array(signature='o'))
+pulse_core.ListenForSignal('org.PulseAudio.Core1.FallbackSinkUpdated', dbus.Array(signature='o'))
+pulse_core.ListenForSignal('org.PulseAudio.Core1.FallbackSinkUnset', dbus.Array(signature='o'))
+pulse_core.ListenForSignal('org.PulseAudio.Core1.NewRecordStream', dbus.Array(signature='o'))
+pulse_core.ListenForSignal('org.PulseAudio.Core1.RecordStreamRemoved', dbus.Array(signature='o'))
 
 udev = GUdev.Client.new(['power_supply'])
 udev.connect('uevent', schedule_update)
@@ -211,10 +287,10 @@ link_dir = Gio.File.new_for_path('/run/systemd/netif/links')
 link_mon = link_dir.monitor_directory(Gio.FileMonitorFlags.NONE, None)
 link_mon.connect('changed', schedule_update)
 
-GLib.timeout_add_seconds(5, update_cpustat)
+GLib.timeout_add_seconds(5, update_stats)
 GLib.timeout_add_seconds(5, schedule_update)
 
-update_cpustat()
+update_stats()
 schedule_update()
 
 try:
