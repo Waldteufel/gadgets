@@ -1,0 +1,12 @@
+#!/usr/bin/sh
+(
+	sleep 1
+	read DOCKED </sys/devices/platform/dock.2/docked
+	if [[ $DOCKED == 0 ]]
+	then
+		POWER=false
+	else
+		POWER=true
+	fi
+	busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b $POWER
+) &
